@@ -29,7 +29,7 @@ PRIVATE_KEY=your_private_key_here
 ## Usage
 To start the script, run:
 ```sh
-npm start
+node mint.js
 ```
 ## Dependencies
 - [ethers.js](https://www.npmjs.com/package/ethers)
