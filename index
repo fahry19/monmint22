@@ -1,0 +1,294 @@
+const ethers = require('ethers');
+const puppeteer = require('puppeteer');
+const dotenv = require('dotenv');
+const CONFIG = require("./utils/config.js");
+const displayHeader = require("./src/displayHeader");
+
+dotenv.config();
+displayHeader();
+
+const RPC_URL = CONFIG.RPC_URL;
+const EXPLORER_URL = 'https://testnet.monadexplorer.com/tx/';
+const GAS_LIMIT = 500000;
+const MAX_RETRY = 3;
+const RETRY_DELAY = 500;
+const MAX_CONCURRENT_TX = 10;
+const GAS_MULTIPLIER = 3.0;
+
+const provider = new ethers.providers.JsonRpcProvider(RPC_URL);
+const wallet = new ethers.Wallet(process.env.PRIVATE_KEY, provider);
+
+const REQUEST_HEADERS = {
+  'accept': 'application/json, text/plain, */*',
+  'accept-encoding': 'gzip, deflate, br, zstd',
+  'accept-language': 'en-US,en;q=0.9,id;q=0.8',
+  'origin': 'https://magiceden.io',
+  'referer': 'https://magiceden.io/',
+  'user-agent': 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
+};
+
+function log(message) {
+  console.log(`➤ ${message}`);
+}
+
+function getUserInput(prompt) {
+  return new Promise((resolve) => {
+    process.stdout.write(prompt);
+    process.stdin.once('data', (data) => resolve(data.toString().trim()));
+  });
+}
+
+function convertCollectionLinkToApiUrl(collectionLink) {
+  const match = collectionLink.match(/\/mint-terminal\/monad-testnet\/(0x[a-fA-F0-9]{40})/);
+  if (!match) throw new Error('Invalid Magic Eden collection link');
+  const contract = match[1];
+  return `https://api-mainnet.magiceden.io/v3/rtp/monad-testnet/tokens/v7?tokens[]=${contract}:0&limit=1`;
+}
+
+async function fetchMintStartTime(collectionId) {
+  const apiUrl = 'https://api-mainnet.magiceden.io/v4/collections';
+  const payload = {
+    chain: 'monad-testnet',
+    collectionIds: [collectionId],
+    includeMintConfig: true,
+  };
+
+  const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox'] });
+  const page = await browser.newPage();
+
+  try {
+    await page.setExtraHTTPHeaders(REQUEST_HEADERS);
+    await page.setRequestInterception(true);
+
+    page.on('request', (request) => {
+      if (request.url() === apiUrl) {
+        request.continue({
+          method: 'POST',
+          postData: JSON.stringify(payload),
+          headers: {
+            ...REQUEST_HEADERS,
+            'Content-Type': 'application/json',
+          },
+        });
+      } else {
+        request.continue();
+      }
+    });
+
+    await page.goto(apiUrl, { waitUntil: 'networkidle2' });
+    const rawResponse = await page.evaluate(() => document.body.textContent);
+
+    let jsonBody;
+    try {
+      jsonBody = JSON.parse(rawResponse);
+    } catch (error) {
+      log(`Error parsing response: ${error.message}`);
+      await browser.close();
+      return null;
+    }
+
+    if (!jsonBody.collections || !jsonBody.collections.length) {
+      log('Failed to fetch start time: No collection data');
+      await browser.close();
+      return null;
+    }
+
+    const mintConfig = jsonBody.collections[0]?.chainData?.mintConfig;
+    if (!mintConfig || !mintConfig.stages || !mintConfig.stages.length) {
+      log('No mint stages found in response');
+      await browser.close();
+      return null;
+    }
+
+    const startTime = mintConfig.stages[0].startTime;
+    const priceRaw = mintConfig.stages[0].price.raw;
+    log(`Start time: ${new Date(startTime).toLocaleString()}`);
+    log(`Mint price: ${ethers.utils.formatEther(priceRaw)} MON`);
+    await browser.close();
+    return {
+      launchTime: new Date(startTime).getTime() / 1000,
+      priceWei: ethers.BigNumber.from(priceRaw),
+    };
+  } catch (error) {
+    log(`Error fetching start time: ${error.message}`);
+    await browser.close();
+    return null;
+  }
+}
+
+async function fetchLatestMints() {
+  const collectionLink = await getUserInput('➤ Enter Magic Eden collection link: ');
+  const apiUrl = convertCollectionLinkToApiUrl(collectionLink);
+  const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox'] });
+  const page = await browser.newPage();
+
+  try {
+    await page.setExtraHTTPHeaders(REQUEST_HEADERS);
+    await page.goto(apiUrl, { waitUntil: 'networkidle2' });
+    const rawResponse = await page.evaluate(() => document.body.textContent);
+
+    let jsonBody;
+    try {
+      jsonBody = JSON.parse(rawResponse);
+    } catch (error) {
+      log(`Error parsing v3 response: ${error.message}`);
+      throw new Error('Invalid API response');
+    }
+
+    if (!jsonBody || !jsonBody.tokens || !Array.isArray(jsonBody.tokens)) {
+      log('Fetch error: Invalid API response or no tokens found');
+      throw new Error('Invalid API response');
+    }
+
+    const collections = jsonBody.tokens.map(token => ({
+      collectionId: token.collection?.id || token.token?.contract || 'unknown',
+      collectionName: token.collection?.name || token.token?.name || 'Unnamed Collection',
+      mintStages: token.token?.mintStages || [],
+      isMinting: token.token?.isMinting !== undefined ? token.token.isMinting : true,
+      protocol: token.token?.kind || 'unknown',
+      tokenId: token.token?.tokenId || '0',
+    }));
+    log(`Found collections: ${collections.length}`);
+    await browser.close();
+    return collections;
+  } catch (error) {
+    log(`Fetch error: ${error.message}`);
+    await browser.close();
+    return [];
+  }
+}
+
+async function getDynamicGas() {
+  const feeData = await provider.getFeeData();
+  return {
+    maxFeePerGas: feeData.maxFeePerGas.mul(Math.floor(GAS_MULTIPLIER * 100)).div(100),
+    maxPriorityFeePerGas: feeData.maxPriorityFeePerGas.mul(Math.floor(GAS_MULTIPLIER * 100)).div(100),
+  };
+}
+
+async function prepareMintTx({ collectionId, priceWei, protocol, tokenId }) {
+  const selector = protocol === 'erc1155' ? '0x9b4f3af5' : '0x9f93f779';
+  let calldata;
+
+  if (protocol === 'erc1155') {
+    const toPadded = ethers.utils.hexZeroPad(wallet.address, 32).slice(2);
+    const idPadded = ethers.utils.hexZeroPad(ethers.utils.hexlify(parseInt(tokenId)), 32).slice(2);
+    const amountPadded = ethers.utils.hexZeroPad('0x1', 32).slice(2);
+    const dataOffsetPadded = ethers.utils.hexZeroPad('0x80', 32).slice(2);
+    const dataLengthPadded = ethers.utils.hexZeroPad('0x0', 32).slice(2);
+    calldata = selector + toPadded + idPadded + amountPadded + dataOffsetPadded + dataLengthPadded;
+  } else {
+    const toPadded = ethers.utils.hexZeroPad(wallet.address, 32).slice(2);
+    const amountPadded = ethers.utils.hexZeroPad('0x1', 32).slice(2);
+    calldata = selector + toPadded + amountPadded;
+  }
+
+  return {
+    to: collectionId,
+    value: priceWei,
+    gasLimit: GAS_LIMIT,
+    data: calldata,
+  };
+}
+
+async function mintOnChain({ collectionId, priceWei, collectionName, protocol, tokenId, mintCount }) {
+  log(`Preparing to mint ${mintCount} NFTs for ${collectionName}`);
+
+  const baseNonce = await provider.getTransactionCount(wallet.address, 'pending');
+  const gasParams = await getDynamicGas();
+  const baseTx = await prepareMintTx({ collectionId, priceWei, protocol, tokenId });
+
+  const txPromises = [];
+  for (let i = 0; i < mintCount; i++) {
+    const txOverrides = {
+      ...baseTx,
+      ...gasParams,
+      nonce: baseNonce + i,
+    };
+
+    const attemptMint = async (attempt = 1) => {
+      try {
+        const txResponse = await wallet.sendTransaction(txOverrides);
+        log(`Tx ${i + 1} sent: ${EXPLORER_URL}${txResponse.hash}`);
+        const receipt = await txResponse.wait(1);
+        if (receipt.status === 1) log(`Tx ${i + 1} success`);
+        else throw new Error('Transaction failed');
+      } catch (error) {
+        log(`Mint ${i + 1} error (attempt ${attempt}): ${error.message}`);
+        if (attempt < MAX_RETRY) {
+          await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
+          return attemptMint(attempt + 1);
+        }
+      }
+    };
+
+    txPromises.push(attemptMint());
+    if (txPromises.length >= MAX_CONCURRENT_TX) await Promise.all(txPromises.splice(0));
+  }
+
+  await Promise.all(txPromises);
+  log(`Minting complete for ${collectionName}`);
+}
+
+async function checkMintDetails(collections) {
+  log('Checking details');
+  let targetCollection = null;
+
+  for (const collection of collections) {
+    const { collectionId, collectionName, isMinting, protocol, tokenId } = collection;
+    log(`Minting: ${isMinting} | Protocol: ${protocol}`);
+
+    if (!isMinting) {
+      log('Skip: Not active');
+      continue;
+    }
+
+    const mintCount = parseInt(await getUserInput(`➤ Enter NFT mint count for ${collectionName}: `));
+    if (isNaN(mintCount) || mintCount <= 0) {
+      log('Invalid input');
+      return null;
+    }
+
+    const mintData = await fetchMintStartTime(collectionId);
+    if (!mintData) {
+      log('Failed to determine launch time or price, aborting');
+      return null;
+    }
+
+    const { launchTime, priceWei } = mintData;
+    const now = Math.floor(Date.now() / 1000);
+    if (launchTime > now) {
+      const waitMs = (launchTime - now - 0.5) * 1000;
+      log(`Waiting ${waitMs / 1000}s for launch: ${collectionName} at ${new Date(launchTime * 1000).toLocaleString()}`);
+      await new Promise(resolve => setTimeout(resolve, waitMs));
+    } else {
+      log(`Launch time already passed, proceeding immediately: ${collectionName}`);
+    }
+
+    targetCollection = { collectionId, priceWei, collectionName, protocol, tokenId, mintCount };
+    break;
+  }
+
+  if (!targetCollection || !['erc1155', 'erc721'].includes(targetCollection.protocol)) {
+    log('Error: No eligible collection or unsupported protocol');
+    return null;
+  }
+
+  log(`Eligible: ${targetCollection.collectionName}`);
+  return targetCollection;
+}
+
+async function runBot() {
+  log('Starting Magiceden Mint Bot');
+  const collections = await fetchLatestMints();
+  if (!collections.length) return log('No collections');
+
+  const eligibleCollection = await checkMintDetails(collections);
+  if (!eligibleCollection) return log('No eligible');
+
+  await mintOnChain(eligibleCollection);
+  log('Done');
+  process.exit(0);
+}
+
+runBot().catch(error => log(`Bot crashed: ${error.message}`));
